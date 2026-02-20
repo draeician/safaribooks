@@ -354,7 +354,7 @@ class SafariBooks:
             sys.setrecursionlimit(len(self.book_chapters))
 
         self.book_title = self.book_info["title"]
-        self.base_url = self.book_info["web_url"]
+        self.base_url = self.book_info.get("web_url", self.book_info.get("url", ""))
 
         self.clean_book_title = "".join(self.escape_dirname(self.book_title).split(",")[:2]) \
                                 + " ({0})".format(self.book_id)
@@ -534,7 +534,53 @@ class SafariBooks:
         if response == 0:
             self.display.exit("API: unable to retrieve book info.")
 
-        response = response.json()
+        try:
+            response = response.json()
+        except Exception:
+            self.display.error("v1 API Error. Server returned HTML. Falling back to v2...")
+            v2_url = SAFARI_BASE_URL + f"/api/v2/epubs/urn:orm:book:{self.book_id}/"
+            resp_v2 = self.requests_provider(v2_url)
+            if resp_v2 == 0:
+                self.display.exit("API: v2 fallback failed.")
+            try:
+                response = resp_v2.json()
+            except Exception:
+                self.display.exit("API: v2 fallback also failed to return JSON.")
+            
+            if "ourn" in response:
+                # Map v2 structure to what v1 logic expects
+                response["web_url"] = response.get("url", "")
+                response["issued"] = response.get("publication_date", "")[:10] if response.get("publication_date") else ""
+                
+                descs = response.get("descriptions", {})
+                if isinstance(descs, dict):
+                    desc_text = descs.get("text/html", descs.get("text/plain", descs.get("en", descs.get("long", ""))))
+                    response["description"] = desc_text if desc_text else str(descs)
+                elif isinstance(descs, list) and descs:
+                    response["description"] = str(descs[0])
+                elif isinstance(descs, str):
+                    response["description"] = descs
+                    
+                # The epub endpoint lacks authors/publishers. Search API has them.
+                search_url = SAFARI_BASE_URL + f"/api/v2/search/?query={self.book_id}"
+                search_resp = self.requests_provider(search_url)
+                if search_resp != 0:
+                    try:
+                        results = search_resp.json().get("results", [])
+                        if results:
+                            # Match the exact book ID to avoid search pollution
+                            res = next((r for r in results if self.book_id in r.get("isbn", "") or self.book_id in r.get("archive_id", "")), results[0])
+                            
+                            # v1 code iterates over a list of dicts for names
+                            response["authors"] = [{"name": a} for a in res.get("authors", [])]
+                            response["publishers"] = [{"name": p} for p in res.get("publishers", [])]
+                            response["rights"] = res.get("rights", "n/d")
+                            
+                            if not response.get("issued"):
+                                response["issued"] = res.get("issued", "")[:10]
+                    except Exception:
+                        pass
+
         if not isinstance(response, dict) or len(response.keys()) == 1:
             self.display.exit(self.display.api_error(response))
 
@@ -548,6 +594,50 @@ class SafariBooks:
         return response
 
     def get_book_chapters(self, page=1):
+        if "ourn" in self.book_info:
+            toc_url = SAFARI_BASE_URL + f"/api/v2/epubs/urn:orm:book:{self.book_id}/table-of-contents/"
+            response = self.requests_provider(toc_url)
+            if response == 0:
+                self.display.exit("API: unable to retrieve v2 book TOC.")
+            toc_data = response.json()
+            
+            chapters = []
+            def extract_chapters(nodes):
+                for node in nodes:
+                    chapters.append(node)
+                    if node.get('children'):
+                        extract_chapters(node['children'])
+            extract_chapters(toc_data)
+            
+            result = []
+            for idx, chap in enumerate(chapters):
+                chap_resp = self.requests_provider(chap['url'])
+                if chap_resp == 0: continue
+                chap_data = chap_resp.json()
+                
+                content_url = chap_data.get('content_url')
+                if not content_url:
+                    continue
+                    
+                filename = content_url.split('/')[-1]
+                if not filename.endswith('.html') and not filename.endswith('.xhtml'):
+                    filename += '.html'
+                    
+                item = {
+                    "title": chap.get("title", f"Chapter {idx}"),
+                    "filename": filename,
+                    "content": content_url,
+                    "asset_base_url": "",
+                    "images": chap_data.get("related_assets", {}).get("images", []),
+                    "stylesheets": [{"url": s} for s in chap_data.get("related_assets", {}).get("stylesheets", [])]
+                }
+                result.append(item)
+                
+            cover_chaps = [c for c in result if "cover" in c["filename"].lower() or "cover" in c["title"].lower()]
+            for c in cover_chaps:
+                result.remove(c)
+            return cover_chaps + result
+
         response = self.requests_provider(urljoin(self.api_url, "chapter/?page=%s" % page))
         if response == 0:
             self.display.exit("API: unable to retrieve book chapters.")
@@ -812,18 +902,14 @@ class SafariBooks:
             self.chapter_title = next_chapter["title"]
             self.filename = next_chapter["filename"]
 
-            asset_base_url = next_chapter['asset_base_url']
-            api_v2_detected = False
-            if 'v2' in next_chapter['content']:
-                asset_base_url = SAFARI_BASE_URL + "/api/v2/epubs/urn:orm:book:{}/files".format(self.book_id)
-                api_v2_detected = True
+            asset_base_url = next_chapter.get('asset_base_url', '')
 
             if "images" in next_chapter and len(next_chapter["images"]):
                 for img_url in next_chapter['images']:
-                    if api_v2_detected:
-                        self.images.append(asset_base_url + '/' + img_url)
+                    if img_url.startswith('http'):
+                        self.images.append(img_url)
                     else:
-                        self.images.append(urljoin(next_chapter['asset_base_url'], img_url))
+                        self.images.append(urljoin(asset_base_url, img_url))
 
 
             # Stylesheets
@@ -1003,24 +1089,51 @@ class SafariBooks:
         return r, c, mx
 
     def create_toc(self):
-        response = self.requests_provider(urljoin(self.api_url, "toc/"))
-        if response == 0:
-            self.display.exit("API: unable to retrieve book chapters. "
-                              "Don't delete any files, just run again this program"
-                              " in order to complete the `.epub` creation!")
+        if "ourn" in self.book_info:
+            toc_url = SAFARI_BASE_URL + f"/api/v2/epubs/urn:orm:book:{self.book_id}/table-of-contents/"
+            response = self.requests_provider(toc_url)
+            if response == 0:
+                self.display.exit("API: unable to retrieve v2 TOC.")
+            
+            v2_data = response.json()
+            
+            def translate_v2_toc(nodes):
+                v1_nodes = []
+                for node in nodes:
+                    v1_node = {
+                        "depth": node.get("depth", 1),
+                        "id": node.get("reference_id", ""),
+                        "fragment": node.get("fragment", ""),
+                        "label": node.get("title", ""),
+                        "href": node.get("reference_id", ""),
+                        "children": translate_v2_toc(node.get("children", []))
+                    }
+                    v1_nodes.append(v1_node)
+                return v1_nodes
+            
+            response = translate_v2_toc(v2_data)
+            
+        else:
+            response = self.requests_provider(urljoin(self.api_url, "toc/"))
+            if response == 0:
+                self.display.exit("API: unable to retrieve book chapters.\n"
+                                  "Don't delete any files, just run again this program"
+                                  " in order to complete the `.epub` creation!")
+            try:
+                response = response.json()
+            except Exception:
+                self.display.exit("API: Failed to parse legacy TOC JSON.")
 
-        response = response.json()
-
-        if not isinstance(response, list) and len(response.keys()) == 1:
-            self.display.exit(
-                self.display.api_error(response) +
-                " Don't delete any files, just run again this program"
-                " in order to complete the `.epub` creation!"
-            )
+            if not isinstance(response, list) and len(response.keys()) == 1:
+                self.display.exit(
+                    self.display.api_error(response) +
+                    " Don't delete any files, just run again this program"
+                    " in order to complete the `.epub` creation!"
+                )
 
         navmap, _, max_depth = self.parse_toc(response)
         return self.TOC_NCX.format(
-            (self.book_info["isbn"] if self.book_info["isbn"] else self.book_id),
+            (self.book_info.get("isbn") if self.book_info.get("isbn") else self.book_id),
             max_depth,
             self.book_title,
             ", ".join(aut.get("name", "") for aut in self.book_info.get("authors", [])),
