@@ -14,6 +14,15 @@ Before any usage please read the *O'Reilly*'s [Terms of Service](https://learnin
 
 ---
 
+### 🚀 V2 API Support (2026 Update)
+This fork includes a major overhaul to support O'Reilly's V2 API endpoints. 
+- **Automatic Fallback:** Gracefully handles books that no longer exist on the legacy v1 API.
+- **Improved Metadata:** Correctly maps authors, publishers, and descriptions from the V2 search and metadata endpoints.
+- **Robust TOC:** Uses the official V2 Table of Contents API to preserve correct reading order and chapter nesting.
+- **Flexible Cookies:** Supports both standard `cookies.json` and raw cookie strings.
+
+---
+
 ## Overview:
   * [Requirements & Setup](#requirements--setup)
   * [Usage](#usage)
