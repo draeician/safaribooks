@@ -309,6 +309,33 @@ class SafariBooks:
 
     COOKIE_FLOAT_MAX_AGE_PATTERN = re.compile(r'(max-age=\d*\.\d*)', re.IGNORECASE)
 
+    def load_cookies(self):
+        if not os.path.isfile(COOKIES_FILE):
+            self.display.exit("Login: unable to find `cookies.json` file.\n"
+                              "    Please use the `retrieve_cookies.py` script to generate it.")
+        
+        with open(COOKIES_FILE, "r", encoding="utf-8-sig") as cookie_file:
+            raw_content = cookie_file.read().strip()
+
+        if not raw_content:
+            self.display.exit("Login: `cookies.json` is empty.")
+
+        try:
+            return json.loads(raw_content)
+        except json.JSONDecodeError:
+            # Fallback: Parse raw 'Name=Value; Name2=Value2' string
+            cookies = {}
+            for cookie in raw_content.split(";"):
+                cookie = cookie.strip()
+                if not cookie or "=" not in cookie:
+                    continue
+                name, value = cookie.split("=", 1)
+                cookies[name.strip()] = value.strip()
+            
+            if not cookies:
+                self.display.exit("Login: invalid `cookies.json` format. Use JSON or a raw 'a=b; c=d' string.")
+            return cookies
+
     def __init__(self, args):
         self.args = args
         self.display = Display("info_%s.log" % escape(args.bookid))
@@ -537,49 +564,39 @@ class SafariBooks:
         try:
             response = response.json()
         except Exception:
-            self.display.error("v1 API Error. Server returned HTML. Falling back to v2...")
-            v2_url = SAFARI_BASE_URL + f"/api/v2/epubs/urn:orm:book:{self.book_id}/"
-            resp_v2 = self.requests_provider(v2_url)
+            self.display.error("v1 API Error (HTML returned). Falling back to v2 metadata...")
+            v2_meta_url = SAFARI_BASE_URL + f"/api/v2/metadata/?identifier={self.book_id}"
+            resp_v2 = self.requests_provider(v2_meta_url)
             if resp_v2 == 0:
-                self.display.exit("API: v2 fallback failed.")
-            try:
-                response = resp_v2.json()
-            except Exception:
-                self.display.exit("API: v2 fallback also failed to return JSON.")
+                self.display.exit("API: v2 metadata fallback failed.")
             
-            if "ourn" in response:
-                # Map v2 structure to what v1 logic expects
-                response["web_url"] = response.get("url", "")
-                response["issued"] = response.get("publication_date", "")[:10] if response.get("publication_date") else ""
-                
-                descs = response.get("descriptions", {})
-                if isinstance(descs, dict):
-                    desc_text = descs.get("text/html", descs.get("text/plain", descs.get("en", descs.get("long", ""))))
-                    response["description"] = desc_text if desc_text else str(descs)
-                elif isinstance(descs, list) and descs:
-                    response["description"] = str(descs[0])
-                elif isinstance(descs, str):
-                    response["description"] = descs
-                    
-                # The epub endpoint lacks authors/publishers. Search API has them.
-                search_url = SAFARI_BASE_URL + f"/api/v2/search/?query={self.book_id}"
-                search_resp = self.requests_provider(search_url)
-                if search_resp != 0:
-                    try:
-                        results = search_resp.json().get("results", [])
-                        if results:
-                            # Match the exact book ID to avoid search pollution
-                            res = next((r for r in results if self.book_id in r.get("isbn", "") or self.book_id in r.get("archive_id", "")), results[0])
-                            
-                            # v1 code iterates over a list of dicts for names
-                            response["authors"] = [{"name": a} for a in res.get("authors", [])]
-                            response["publishers"] = [{"name": p} for p in res.get("publishers", [])]
-                            response["rights"] = res.get("rights", "n/d")
-                            
-                            if not response.get("issued"):
-                                response["issued"] = res.get("issued", "")[:10]
-                    except Exception:
-                        pass
+            v2_data = resp_v2.json()
+            if not v2_data.get("results"):
+                self.display.exit("API: v2 metadata returned no results.")
+            
+            res = v2_data["results"][0]
+            # Map v2 fields to legacy v1 structure
+            response = {
+                "title": res.get("name", ""),
+                "identifier": res.get("identifier", self.book_id),
+                "isbn": res.get("isbn", ""),
+                "publishers": res.get("publishers", []),
+                "rights": res.get("rights", "n/d"),
+                "issued": res.get("publication_date", "")[:10],
+                "web_url": res.get("web_url", ""),
+                "ourn": res.get("ourn", "")
+            }
+            
+            # Map Authors from talent object
+            contributors = res.get("talent", {}).get("contributors", [])
+            response["authors"] = [{"name": c.get("name")} for c in contributors if c.get("contributor_type") == "author"]
+            
+            # Map Description from dict
+            descs = res.get("description", {})
+            if isinstance(descs, dict):
+                response["description"] = descs.get("text/html", descs.get("text/plain", ""))
+            else:
+                response["description"] = str(descs)
 
         if not isinstance(response, dict) or len(response.keys()) == 1:
             self.display.exit(self.display.api_error(response))
